@@ -3,6 +3,7 @@
 from mempalace.convo_miner import (
     chunk_exchanges,
     detect_convo_room,
+    mine_convos,
     scan_convos,
 )
 
@@ -111,3 +112,54 @@ class TestScanConvos:
     def test_scan_empty_dir(self, tmp_path):
         files = scan_convos(str(tmp_path))
         assert files == []
+
+
+class FakeCollection:
+    def __init__(self):
+        self.deleted = []
+        self.upserts = []
+
+    def delete(self, **kwargs):
+        self.deleted.append(kwargs)
+
+    def upsert(self, *, documents, ids, metadatas=None):
+        self.upserts.append(
+            {
+                "documents": documents,
+                "ids": ids,
+                "metadatas": metadatas or [],
+            }
+        )
+
+
+def test_mine_convos_reimports_modified_transcript(monkeypatch, tmp_path):
+    transcript = tmp_path / "chat.jsonl"
+    transcript.write_text(
+        "> What changed?\nThe last session crashed before it could save.\n\n"
+        "> How do we recover?\nRe-mine the Codex transcript on the next session start.\n",
+        encoding="utf-8",
+    )
+
+    fake_collection = FakeCollection()
+    seen_check_mtime = []
+
+    monkeypatch.setattr("mempalace.convo_miner.scan_convos", lambda _: [transcript])
+    monkeypatch.setattr("mempalace.convo_miner.get_collection", lambda _: fake_collection)
+    monkeypatch.setattr("mempalace.convo_miner.normalize", lambda _: transcript.read_text())
+
+    def fake_file_already_mined(collection, source_file, check_mtime=False):
+        seen_check_mtime.append(check_mtime)
+        return False
+
+    monkeypatch.setattr("mempalace.convo_miner.file_already_mined", fake_file_already_mined)
+
+    mine_convos(str(tmp_path), str(tmp_path / "palace"), wing="codex")
+
+    assert seen_check_mtime == [True]
+    assert fake_collection.deleted == [{"where": {"source_file": str(transcript.resolve())}}]
+    assert fake_collection.upserts
+    assert all(
+        "source_mtime" in metadata
+        for call in fake_collection.upserts
+        for metadata in call["metadatas"]
+    )

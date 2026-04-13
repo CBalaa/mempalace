@@ -40,19 +40,22 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
     ChromaDB on the first pass.
     """
     sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    metadata = {
+        "wing": wing,
+        "room": "_registry",
+        "source_file": source_file,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "registry",
+    }
+    try:
+        metadata["source_mtime"] = os.path.getmtime(source_file)
+    except OSError:
+        pass
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
-        metadatas=[
-            {
-                "wing": wing,
-                "room": "_registry",
-                "source_file": source_file,
-                "added_by": agent,
-                "filed_at": datetime.now().isoformat(),
-                "ingest_mode": "registry",
-            }
-        ],
+        metadatas=[metadata],
     )
 
 
@@ -272,6 +275,104 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
+def _extract_convo_chunks(content: str, extract_mode: str) -> list:
+    """Extract conversation chunks using the configured strategy."""
+    if extract_mode == "general":
+        from .general_extractor import extract_memories
+
+        return extract_memories(content)
+    return chunk_exchanges(content)
+
+
+def _report_dry_run(filepath: Path, chunks: list, extract_mode: str, room: str, room_counts: dict):
+    """Print dry-run output and update room counters."""
+    if extract_mode == "general":
+        from collections import Counter
+
+        type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+        types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+        print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+        for chunk in chunks:
+            room_counts[chunk.get("memory_type", "general")] += 1
+        return
+
+    print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+    room_counts[room] += 1
+
+
+def _build_chunk_metadata(
+    wing: str,
+    room: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    extract_mode: str,
+) -> dict:
+    """Build one conversation drawer metadata payload."""
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "source_file": source_file,
+        "chunk_index": chunk_index,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "convos",
+        "extract_mode": extract_mode,
+    }
+    try:
+        metadata["source_mtime"] = os.path.getmtime(source_file)
+    except OSError:
+        pass
+    return metadata
+
+
+def _store_convo_chunks(
+    collection,
+    chunks: list,
+    source_file: str,
+    wing: str,
+    room: str,
+    agent: str,
+    extract_mode: str,
+    room_counts: dict,
+) -> int:
+    """Store extracted conversation chunks and update room counters."""
+    drawers_added = 0
+    if extract_mode != "general":
+        room_counts[room] += 1
+
+    for chunk in chunks:
+        chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+        if extract_mode == "general":
+            room_counts[chunk_room] += 1
+
+        drawer_id = (
+            f"drawer_{wing}_{chunk_room}_"
+            f"{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+        )
+        try:
+            collection.upsert(
+                documents=[chunk["content"]],
+                ids=[drawer_id],
+                metadatas=[
+                    _build_chunk_metadata(
+                        wing=wing,
+                        room=chunk_room,
+                        source_file=source_file,
+                        chunk_index=chunk["chunk_index"],
+                        agent=agent,
+                        extract_mode=extract_mode,
+                    )
+                ],
+            )
+            drawers_added += 1
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                raise
+
+    return drawers_added
+
+
 def mine_convos(
     convo_dir: str,
     palace_path: str,
@@ -317,9 +418,17 @@ def mine_convos(
         source_file = str(filepath)
 
         # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
+        if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
             files_skipped += 1
             continue
+
+        # Purge stale drawers before re-filing a modified transcript so the
+        # stored conversation always matches the current transcript on disk.
+        if not dry_run:
+            try:
+                collection.delete(where={"source_file": source_file})
+            except Exception:
+                pass
 
         # Normalize format
         try:
@@ -334,14 +443,7 @@ def mine_convos(
                 _register_file(collection, source_file, wing, agent)
             continue
 
-        # Chunk — either exchange pairs or general extraction
-        if extract_mode == "general":
-            from .general_extractor import extract_memories
-
-            chunks = extract_memories(content)
-            # Each chunk already has memory_type; use it as the room name
-        else:
-            chunks = chunk_exchanges(content)
+        chunks = _extract_convo_chunks(content, extract_mode)
 
         if not chunks:
             if not dry_run:
@@ -355,55 +457,20 @@ def mine_convos(
             room = None  # set per-chunk below
 
         if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
-            else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+            _report_dry_run(filepath, chunks, extract_mode, room, room_counts)
             total_drawers += len(chunks)
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
-                room_counts[room] += 1
             continue
 
-        if extract_mode != "general":
-            room_counts[room] += 1
-
-        # File each chunk
-        drawers_added = 0
-        for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            try:
-                collection.upsert(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                        }
-                    ],
-                )
-                drawers_added += 1
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
-
+        drawers_added = _store_convo_chunks(
+            collection=collection,
+            chunks=chunks,
+            source_file=source_file,
+            wing=wing,
+            room=room,
+            agent=agent,
+            extract_mode=extract_mode,
+            room_counts=room_counts,
+        )
         total_drawers += drawers_added
         print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from mempalace.hooks_cli import (
     _count_human_messages,
     _log,
     _maybe_auto_ingest,
+    run_codex_backfill_worker,
     _parse_harness_input,
     _sanitize_session_id,
     hook_stop,
@@ -201,6 +203,30 @@ def test_session_start_passes_through(tmp_path):
     assert result == {}
 
 
+def test_session_start_codex_backfills_sessions_root(tmp_path):
+    sessions_root = tmp_path / ".codex" / "sessions"
+    transcript_dir = sessions_root / "2026" / "04" / "13"
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "rollout-1.jsonl"
+    transcript.write_text("", encoding="utf-8")
+
+    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+        result = _capture_hook_output(
+            hook_session_start,
+            {"session_id": "test", "transcript_path": str(transcript)},
+            harness="codex",
+            state_dir=tmp_path,
+        )
+
+    assert result == {}
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args.args[0]
+    assert cmd[0] == sys.executable
+    assert cmd[1] == "-c"
+    assert cmd[-2] == str(tmp_path / "codex_backfill.lock")
+    assert cmd[-1] == str(sessions_root)
+
+
 # --- hook_precompact ---
 
 
@@ -212,6 +238,44 @@ def test_precompact_always_blocks(tmp_path):
     )
     assert result["decision"] == "block"
     assert result["reason"] == PRECOMPACT_BLOCK_REASON
+
+
+def test_run_codex_backfill_worker_runs_once_and_releases_lock(tmp_path):
+    lock_path = tmp_path / "codex_backfill.lock"
+    sessions_root = tmp_path / ".codex" / "sessions"
+    sessions_root.mkdir(parents=True)
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+            run_codex_backfill_worker(str(lock_path), str(sessions_root))
+
+    mock_run.assert_called_once_with(
+        [
+            sys.executable,
+            "-m",
+            "mempalace",
+            "mine",
+            str(sessions_root),
+            "--mode",
+            "convos",
+        ],
+        stdout=mock_run.call_args.kwargs["stdout"],
+        stderr=mock_run.call_args.kwargs["stderr"],
+    )
+    assert not lock_path.exists()
+
+
+def test_run_codex_backfill_worker_skips_when_lock_exists(tmp_path):
+    lock_path = tmp_path / "codex_backfill.lock"
+    lock_path.write_text("held", encoding="utf-8")
+    sessions_root = tmp_path / ".codex" / "sessions"
+    sessions_root.mkdir(parents=True)
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+            run_codex_backfill_worker(str(lock_path), str(sessions_root))
+
+    mock_run.assert_not_called()
 
 
 # --- _log ---

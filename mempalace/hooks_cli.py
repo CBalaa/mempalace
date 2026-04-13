@@ -111,6 +111,104 @@ def _maybe_auto_ingest():
             pass
 
 
+def _find_named_ancestor(path: Path, name: str):
+    """Return the nearest ancestor with the given directory name."""
+    for candidate in (path, *path.parents):
+        if candidate.name == name:
+            return candidate
+    return None
+
+
+def _detect_codex_sessions_dir(transcript_path: str):
+    """Infer the Codex sessions root from the current transcript path."""
+    if transcript_path:
+        try:
+            path = Path(transcript_path).expanduser()
+            start = path if path.is_dir() else path.parent
+            sessions_dir = _find_named_ancestor(start, "sessions")
+            if sessions_dir and sessions_dir.is_dir():
+                return sessions_dir
+        except OSError:
+            pass
+
+    default_dir = Path.home() / ".codex" / "sessions"
+    if default_dir.is_dir():
+        return default_dir
+    return None
+
+
+def _codex_backfill_lock_path():
+    return STATE_DIR / "codex_backfill.lock"
+
+
+def run_codex_backfill_worker(lock_path: str, sessions_dir: str):
+    """Background helper: run a single Codex transcript backfill under a lock."""
+    lock_file = Path(lock_path)
+    sessions_path = Path(sessions_dir).expanduser()
+
+    try:
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        _log(f"CODEX BACKFILL skipped (lock held): {sessions_path}")
+        return
+    except OSError:
+        return
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {os.getpid()}\n")
+
+        _log(f"CODEX BACKFILL started: {sessions_path}")
+        log_path = STATE_DIR / "hook.log"
+        with open(log_path, "a") as log_f:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mempalace",
+                    "mine",
+                    str(sessions_path),
+                    "--mode",
+                    "convos",
+                ],
+                stdout=log_f,
+                stderr=log_f,
+            )
+        _log(f"CODEX BACKFILL finished: {sessions_path}")
+    except OSError:
+        pass
+    finally:
+        try:
+            lock_file.unlink()
+        except OSError:
+            pass
+
+
+def _maybe_backfill_codex_transcripts(transcript_path: str):
+    """Kick off a background convo mine for Codex transcript history."""
+    sessions_dir = _detect_codex_sessions_dir(transcript_path)
+    if sessions_dir is None:
+        return
+
+    lock_path = _codex_backfill_lock_path()
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from mempalace.hooks_cli import run_codex_backfill_worker; "
+                    "import sys; "
+                    "run_codex_backfill_worker(sys.argv[1], sys.argv[2])"
+                ),
+                str(lock_path),
+                str(sessions_dir),
+            ]
+        )
+    except OSError:
+        pass
+
+
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
 
 
@@ -181,6 +279,9 @@ def hook_session_start(data: dict, harness: str):
 
     # Initialize session state directory
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if harness == "codex":
+        _maybe_backfill_codex_transcripts(parsed["transcript_path"])
 
     # Pass through — no blocking on session start
     _output({})
