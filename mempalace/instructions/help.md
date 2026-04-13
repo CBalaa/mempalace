@@ -68,11 +68,12 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ## Auto-Save Hooks
 
-- Stop hook -- Automatically saves memories every 15 messages. Counts human
-  messages in the session transcript (skipping command-messages). When the
-  threshold is reached, blocks the AI with a save instruction. Uses
-  ~/.mempalace/hook_state/ to track save points per session. If
-  stop_hook_active is true, passes through to prevent infinite loops.
+- Stop hook -- Automatically saves memories every 5 messages by default.
+  Counts human messages in the session transcript (skipping
+  command-messages). When the threshold is reached, blocks the AI with a
+  save instruction. Uses ~/.mempalace/hook_state/ to track save points per
+  session. If stop_hook_active is true, passes through to prevent infinite
+  loops. Override the interval with MEMPAL_SAVE_INTERVAL.
 
 - PreCompact hook -- Emergency save before context compaction. Always blocks
   with a comprehensive save instruction because compaction means the AI is

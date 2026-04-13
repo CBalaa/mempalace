@@ -14,23 +14,42 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-SAVE_INTERVAL = 15
+SAVE_INTERVAL = 5
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 
 STOP_BLOCK_REASON = (
-    "AUTO-SAVE checkpoint. Save key topics, decisions, quotes, and code "
-    "from this session to your memory system. Organize into appropriate "
-    "categories. Use verbatim quotes where possible. Continue conversation "
-    "after saving."
+    "AUTO-SAVE checkpoint. Use MemPalace tools to save key topics, "
+    "decisions, quotes, and code from this session to your memory system. "
+    "Organize into appropriate categories. Use verbatim quotes where "
+    "possible. Continue conversation after saving."
 )
 
 PRECOMPACT_BLOCK_REASON = (
-    "COMPACTION IMMINENT. Save ALL topics, decisions, quotes, code, and "
-    "important context from this session to your memory system. Be thorough "
-    "\u2014 after compaction, detailed context will be lost. Organize into "
-    "appropriate categories. Use verbatim quotes where possible. Save "
-    "everything, then allow compaction to proceed."
+    "COMPACTION IMMINENT. Use MemPalace tools to save ALL topics, decisions, "
+    "quotes, code, and important context from this session to your memory "
+    "system. Be thorough \u2014 after compaction, detailed context will be "
+    "lost. Organize into appropriate categories. Use verbatim quotes where "
+    "possible. Save everything, then allow compaction to proceed."
 )
+
+
+def _get_save_interval() -> int:
+    """Return the stop-hook interval, allowing environment override."""
+    raw_value = os.environ.get("MEMPAL_SAVE_INTERVAL", "").strip()
+    if not raw_value:
+        return SAVE_INTERVAL
+
+    try:
+        interval = int(raw_value)
+    except ValueError:
+        _log(f"Invalid MEMPAL_SAVE_INTERVAL={raw_value!r}; using default {SAVE_INTERVAL}")
+        return SAVE_INTERVAL
+
+    if interval < 1:
+        _log(f"MEMPAL_SAVE_INTERVAL must be >= 1; using default {SAVE_INTERVAL}")
+        return SAVE_INTERVAL
+
+    return interval
 
 
 def _sanitize_session_id(session_id: str) -> str:
@@ -230,6 +249,7 @@ def hook_stop(data: dict, harness: str):
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
+    save_interval = _get_save_interval()
 
     # If already in a save cycle, let through (infinite-loop prevention)
     if str(stop_hook_active).lower() in ("true", "1", "yes"):
@@ -253,14 +273,14 @@ def hook_stop(data: dict, harness: str):
 
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
+    if since_last >= save_interval and exchange_count > 0:
         # Update last save point
         try:
             last_save_file.write_text(str(exchange_count), encoding="utf-8")
         except OSError:
             pass
 
-        _log(f"TRIGGERING SAVE at exchange {exchange_count}")
+        _log(f"TRIGGERING SAVE at exchange {exchange_count} (interval={save_interval})")
 
         # Optional: auto-ingest if MEMPAL_DIR is set
         _maybe_auto_ingest()

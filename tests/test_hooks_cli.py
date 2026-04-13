@@ -11,6 +11,7 @@ from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     STOP_BLOCK_REASON,
     PRECOMPACT_BLOCK_REASON,
+    _get_save_interval,
     _count_human_messages,
     _log,
     _maybe_auto_ingest,
@@ -189,6 +190,33 @@ def test_stop_hook_tracks_save_point(tmp_path):
     # Second call with same count passes through (already saved)
     result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert result == {}
+
+
+def test_get_save_interval_env_override():
+    with patch.dict("os.environ", {"MEMPAL_SAVE_INTERVAL": "3"}):
+        assert _get_save_interval() == 3
+
+
+def test_get_save_interval_invalid_env_falls_back(tmp_path):
+    with patch.dict("os.environ", {"MEMPAL_SAVE_INTERVAL": "not-a-number"}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            assert _get_save_interval() == SAVE_INTERVAL
+
+
+def test_stop_hook_respects_save_interval_env(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    with patch.dict("os.environ", {"MEMPAL_SAVE_INTERVAL": "3"}):
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    assert result["decision"] == "block"
+    assert result["reason"] == STOP_BLOCK_REASON
 
 
 # --- hook_session_start ---
